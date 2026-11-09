@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fall Detection - Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f4f6f9; --card:#fff; --text:#1c2733; --muted:#6b7785; --ok:#1f9d55; --bad:#d62828; --accent:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); padding:16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:12px; }
+  .card { background:var(--card); border-radius:10px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .value { font-size:28px; font-weight:600; margin-top:4px; }
+  .unit { font-size:13px; color:var(--muted); margin-left:3px; }
+  #statusCard.normal { border-left:6px solid var(--ok); }
+  #statusCard.warn   { border-left:6px solid #f59e0b; }
+  #statusCard.fall   { border-left:6px solid var(--bad); background:#fff1f1; animation:blink 1s infinite; }
+  @keyframes blink { 50% { background:#ffd9d9; } }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; margin-bottom:12px; }
+  .chartbox { height:240px; position:relative; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; }
+  button { border:0; border-radius:8px; padding:12px 18px; font-size:15px; cursor:pointer; background:#e5e9ef; color:var(--text); }
+  button.on { background:var(--accent); color:#fff; }
+  button.reset { background:var(--bad); color:#fff; }
+  #conn { font-size:12px; }
+  #conn.ok { color:var(--ok); } #conn.err { color:var(--bad); }
+</style>
+</head>
+<body>
+  <h1>Phát hiện té ngã - ESP32 + MPU6050</h1>
+  <div class="sub">MQTT: <span id="conn" class="err">đang kết nối...</span></div>
+
+  <div class="grid">
+    <div class="card" id="statusCard"><div class="label">Trạng thái</div><div class="value" id="state">--</div></div>
+    <div class="card"><div class="label">Gia tốc tổng</div><div class="value"><span class="a-total" id="a">--</span><span class="unit">g</span></div></div>
+    <div class="card"><div class="label">Góc nghiêng</div><div class="value"><span class="tilt" id="tilt">--</span><span class="unit">°</span></div></div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Gia tốc X</div><div class="value"><span class="ax" id="ax">--</span><span class="unit">g</span></div></div>
+    <div class="card"><div class="label">Gia tốc Y</div><div class="value"><span class="ay" id="ay">--</span><span class="unit">g</span></div></div>
+    <div class="card"><div class="label">Gia tốc Z</div><div class="value"><span class="az" id="az">--</span><span class="unit">g</span></div></div>
+  </div>
+
+  <div class="charts">
+    <div class="card"><div class="label">Gia tốc tổng (g)</div><div class="chartbox"><canvas id="chartA"></canvas></div></div>
+    <div class="card"><div class="label">Góc nghiêng (°)</div><div class="chartbox"><canvas id="chartT"></canvas></div></div>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:10px">Điều khiển thủ công</div>
+    <div class="controls">
+      <button id="btnLed">LED: TẮT</button>
+      <button id="btnBuz">LOA: TẮT</button>
+      <button id="btnRst" class="reset">Xóa cảnh báo (Reset)</button>
+    </div>
+  </div>
+
+<script>
+  const PREFIX = "fall_demo_5a7c/";            // PHẢI trùng với PREFIX trong sketch.ino
+  const BROKER = "wss://broker.hivemq.com:8884/mqtt";
+  const T_DATA = PREFIX + "data";
+
+  const $ = id => document.getElementById(id);
+  const ledState = { led:false, buzzer:false };
+
+  // ---- Biểu đồ ----
+  function makeChart(canvasId, color, yMax) {
+    return new Chart($(canvasId), {
+      type: "line",
+      data: { labels: [], datasets: [{ data: [], borderColor: color, borderWidth: 2, pointRadius: 0, tension: .25 }] },
+      options: { animation:false, maintainAspectRatio:false, plugins:{ legend:{ display:false } },
+                 scales:{ y:{ min:0, suggestedMax:yMax }, x:{ ticks:{ maxTicksLimit:6 } } } }
+    });
+  }
+  const chartA = makeChart("chartA", "#2563eb", 3);
+  const chartT = makeChart("chartT", "#e67e22", 180);
+  function push(chart, value) {
+    const d = chart.data;
+    d.labels.push(new Date().toLocaleTimeString());
+    d.datasets[0].data.push(value);
+    if (d.labels.length > 60) { d.labels.shift(); d.datasets[0].data.shift(); }
+    chart.update();
+  }
+
+  // ---- MQTT ----
+  const client = mqtt.connect(BROKER, { clientId: "web-fall-" + Math.random().toString(16).slice(2, 8), reconnectPeriod: 3000 });
+  client.on("connect", () => { $("conn").textContent = "đã kết nối"; $("conn").className = "ok"; client.subscribe(T_DATA); });
+  client.on("close",   () => { $("conn").textContent = "mất kết nối";  $("conn").className = "err"; });
+  client.on("message", (topic, payload) => {
+    let d; try { d = JSON.parse(payload.toString()); } catch { return; }
+    document.querySelectorAll(".ax").forEach(e => e.textContent = d.ax.toFixed(2));
+    document.querySelectorAll(".ay").forEach(e => e.textContent = d.ay.toFixed(2));
+    document.querySelectorAll(".az").forEach(e => e.textContent = d.az.toFixed(2));
+    document.querySelectorAll(".a-total").forEach(e => e.textContent = d.a.toFixed(2));
+    document.querySelectorAll(".tilt").forEach(e => e.textContent = d.tilt.toFixed(1));
+    push(chartA, d.a); push(chartT, d.tilt);
+
+    const names = { NORMAL:"BÌNH THƯỜNG", FREEFALL:"RƠI TỰ DO", IMPACT:"VA CHẠM", FALL:"TÉ NGÃ!" };
+    $("state").textContent = names[d.state] || d.state;
+    $("statusCard").className = "card " + (d.state === "FALL" ? "fall" : d.state === "NORMAL" ? "normal" : "warn");
+
+    ledState.led = !!d.led; ledState.buzzer = !!d.buzzer;
+    $("btnLed").textContent = "LED: " + (d.led ? "BẬT" : "TẮT");  $("btnLed").classList.toggle("on", !!d.led);
+    $("btnBuz").textContent = "LOA: " + (d.buzzer ? "BẬT" : "TẮT"); $("btnBuz").classList.toggle("on", !!d.buzzer);
+  });
+
+  // ---- Nút điều khiển ----
+  $("btnLed").onclick = () => client.publish(PREFIX + "cmd/led",    ledState.led ? "OFF" : "ON");
+  $("btnBuz").onclick = () => client.publish(PREFIX + "cmd/buzzer", ledState.buzzer ? "OFF" : "ON");
+  $("btnRst").onclick = () => client.publish(PREFIX + "cmd/reset",  "1");
+</script>
+</body>
+</html>
